@@ -1,11 +1,12 @@
 """
-lib_mgmt.py — Single-file Library Manager (Members / Books / Loans)
+lib_mgmt.py — Single-file Library Manager (Members / Books / Loans / Report)
 - เก็บข้อมูลเป็นไฟล์ .txt แบบ JSON Lines (1 บรรทัด = 1 record)
 - ใช้เฉพาะ Standard Library ของ Python
 - เมนู:
     Main -> Member (Add/Delete/View/Edit)
          -> Book   (Add/Delete/View/Edit)
          -> Loan   (Borrow/Return/View)
+         -> Report (Generate with filters, print or save .txt)
 """
 
 import json
@@ -15,7 +16,7 @@ from datetime import datetime, timedelta
 MEMBERS_FILE = "members.txt"
 BOOKS_FILE   = "books.txt"
 LOANS_FILE   = "loans.txt"
-
+APP_VERSION  = "1.0"
 
 # ========================= Utilities =========================
 def _ensure_file(path: str):
@@ -46,6 +47,11 @@ def _write_jsonl(path: str, rows):
 def _now_iso():
     return datetime.now().isoformat(timespec="seconds")
 
+def _parse_iso(s: str):
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 # ========================= Members =========================
 class MemberManager:
@@ -103,7 +109,6 @@ class MemberManager:
             if m.get("student_id") == student_id:
                 return m
         return None
-
 
 # ========================= Books =========================
 class BookManager:
@@ -173,7 +178,6 @@ class BookManager:
                 _write_jsonl(self.filepath, books)
                 return
         raise ValueError("book not found")
-
 
 # ========================= Loans =========================
 class LoanManager:
@@ -256,6 +260,164 @@ class LoanManager:
 
         return found
 
+# ========================= Report =========================
+class ReportManager:
+    """
+    รวมข้อมูล Members + Books + Loans แล้วพิมพ์รายงานแบบ ASCII
+    รองรับตัวกรอง (filters) และบันทึกไฟล์ได้
+    """
+    def __init__(self, mem_mgr: MemberManager, book_mgr: BookManager, loan_mgr: LoanManager):
+        self.mem_mgr = mem_mgr
+        self.book_mgr = book_mgr
+        self.loan_mgr = loan_mgr
+
+    # ---- table helpers ----
+    def _line(self, width=118, ch="-"):
+        return ch * width
+
+    def _fmt_row(self, cols, widths):
+        out = []
+        for i, w in enumerate(widths):
+            val = str(cols[i]) if i < len(cols) else ""
+            if len(val) > w:
+                val = val[: w-1] + "…"  # truncate
+            out.append(f"{val:<{w}}")
+        return " | ".join(out)
+
+    def _section(self, title):
+        return f"\n{title}\n"
+
+    def build(self, filters: dict) -> str:
+        """
+        filters keys:
+          include_members: bool
+          include_books:   bool
+          include_loans:   bool
+          active_members_only: bool
+          loans_scope: 'all' | 'active' | 'overdue' | 'returned'
+          loans_from: ISO string or ''
+          loans_to:   ISO string or ''
+        """
+        now = datetime.now()
+        header = []
+        header.append("Library System — Summary Report")
+        header.append(f"Generated At : {now.strftime('%Y-%m-%d %H:%M:%S')} (+{now.astimezone().utcoffset()})")
+        header.append(f"App Version  : {APP_VERSION}")
+        header.append("Encoding     : UTF-8")
+        report = "\n".join(header) + "\n" + self._line() + "\n"
+
+        # -------- members table --------
+        members = self.mem_mgr.list_members()
+        if filters.get("active_members_only", False):
+            members = [m for m in members if m.get("active", True)]
+
+        if filters.get("include_members", True):
+            report += self._section("Members (filtered)") + self._line() + "\n"
+            widths = [10, 22, 28, 12, 8, 4, 6]
+            head = ["Student", "Name", "Email", "Phone", "Major", "Year", "Active"]
+            report += self._fmt_row(head, widths) + "\n" + self._line() + "\n"
+            for m in members:
+                name = f"{m.get('first_name','')} {m.get('last_name','')}".strip()
+                row = [
+                    m.get("student_id",""),
+                    name,
+                    m.get("email",""),
+                    m.get("phone",""),
+                    m.get("major",""),
+                    m.get("year",""),
+                    "Yes" if m.get("active",True) else "No",
+                ]
+                report += self._fmt_row(row, widths) + "\n"
+            report += self._line() + "\n"
+
+        # -------- books table --------
+        books = self.book_mgr.list_books()
+        if filters.get("include_books", True):
+            report += self._section("Books") + self._line() + "\n"
+            widths = [8, 24, 18, 6, 7, 7]
+            head = ["BookID", "Title", "Author", "Year", "Copies", "Avail"]
+            report += self._fmt_row(head, widths) + "\n" + self._line() + "\n"
+            for b in books:
+                row = [
+                    b.get("book_id",""),
+                    b.get("title",""),
+                    b.get("author",""),
+                    str(b.get("year","")),
+                    b.get("total_copies",0),
+                    b.get("available_copies",0),
+                ]
+                report += self._fmt_row(row, widths) + "\n"
+            report += self._line() + "\n"
+
+        # -------- loans table (join) --------
+        loans = self.loan_mgr.list_loans()
+        scope = filters.get("loans_scope", "all")
+        if scope == "active":
+            loans = [l for l in loans if l.get("status") == "borrowed"]
+        elif scope == "returned":
+            loans = [l for l in loans if l.get("status") == "returned"]
+        elif scope == "overdue":
+            def _is_overdue(l):
+                if l.get("status") != "borrowed": return False
+                due = _parse_iso(l.get("due_date",""))
+                return bool(due and due < datetime.now())
+            loans = [l for l in loans if _is_overdue(l)]
+
+        # date range filter on loan_date
+        d_from = _parse_iso(filters.get("loans_from","") or "")
+        d_to   = _parse_iso(filters.get("loans_to","") or "")
+        if d_from:
+            loans = [l for l in loans if _parse_iso(l.get("loan_date","")) and _parse_iso(l.get("loan_date","")) >= d_from]
+        if d_to:
+            loans = [l for l in loans if _parse_iso(l.get("loan_date","")) and _parse_iso(l.get("loan_date","")) <= d_to]
+
+        if filters.get("include_loans", True):
+            report += self._section("Loans (joined)") + self._line() + "\n"
+            widths = [12, 8, 22, 8, 20, 8, 19, 19, 19]
+            head = ["LoanID", "StuID", "Student Name", "BookID", "Title", "Status", "LoanDate", "DueDate", "Return"]
+            report += self._fmt_row(head, widths) + "\n" + self._line() + "\n"
+            # build lookup
+            mem_by_id = {m.get("student_id"): m for m in self.mem_mgr.list_members()}
+            book_by_id = {b.get("book_id"): b for b in self.book_mgr.list_books()}
+            for l in loans:
+                m = mem_by_id.get(l.get("student_id"), {})
+                b = book_by_id.get(l.get("book_id"), {})
+                name = f"{m.get('first_name','')} {m.get('last_name','')}".strip()
+                row = [
+                    l.get("loan_id",""),
+                    l.get("student_id",""),
+                    name,
+                    l.get("book_id",""),
+                    b.get("title",""),
+                    l.get("status",""),
+                    l.get("loan_date",""),
+                    l.get("due_date",""),
+                    l.get("return_date",""),
+                ]
+                report += self._fmt_row(row, widths) + "\n"
+            report += self._line() + "\n"
+
+        # -------- Summary --------
+        active_members = [m for m in self.mem_mgr.list_members() if m.get("active", True)]
+        total_books = len(books)
+        total_copies = sum(int(b.get("total_copies",0)) for b in books)
+        avail_copies = sum(int(b.get("available_copies",0)) for b in books)
+        loan_active = [l for l in self.loan_mgr.list_loans() if l.get("status") == "borrowed"]
+        overdue_cnt = 0
+        for l in loan_active:
+            due = _parse_iso(l.get("due_date",""))
+            if due and due < datetime.now():
+                overdue_cnt += 1
+
+        report += self._section("Summary")
+        report += f"- Members (all/active): {len(self.mem_mgr.list_members())} / {len(active_members)}\n"
+        report += f"- Books (titles):       {total_books}\n"
+        report += f"- Copies (total/avail): {total_copies} / {avail_copies}\n"
+        report += f"- Loans (active):       {len(loan_active)}\n"
+        report += f"- Overdue:              {overdue_cnt}\n"
+        report += self._line() + "\n"
+
+        return report
 
 # ========================= Menu Helpers =========================
 def _pause():
@@ -267,7 +429,6 @@ def _input_nonempty(prompt: str) -> str:
         if val:
             return val
         print("กรุณากรอกข้อมูลให้ครบ")
-
 
 # ========================= Member Menus =========================
 def menu_member_add(mgr: MemberManager):
@@ -357,7 +518,6 @@ def menu_member_edit(mgr: MemberManager):
         print(f"❌ Error: {e}")
     _pause()
 
-
 # ========================= Book Menus =========================
 def menu_book_add(mgr: BookManager):
     print("\n=== Book > Add ===")
@@ -441,7 +601,6 @@ def menu_book_edit(mgr: BookManager):
         print(f"❌ Error: {e}")
     _pause()
 
-
 # ========================= Loan Menus =========================
 def menu_loan_borrow(loan_mgr: LoanManager):
     print("\n=== Loan > Borrow ===")
@@ -501,6 +660,44 @@ def menu_loan(loan_mgr: LoanManager):
         else:
             print("Invalid option.")
 
+# ========================= Report Menu =========================
+def menu_report(rep_mgr: ReportManager):
+    print("\n=== Report (with filters) ===")
+    # include sections
+    inc_m = input("Include Members? (Y/n): ").strip().lower() or "y"
+    inc_b = input("Include Books?   (Y/n): ").strip().lower() or "y"
+    inc_l = input("Include Loans?   (Y/n): ").strip().lower() or "y"
+    # filters
+    only_active_m = input("Members: active only? (y/N): ").strip().lower() == "y"
+
+    print("Loans scope: 1) all  2) active  3) overdue  4) returned")
+    scope_map = {"1":"all", "2":"active", "3":"overdue", "4":"returned"}
+    scope_in = input("Choose (1-4, default 1): ").strip() or "1"
+    loans_scope = scope_map.get(scope_in, "all")
+
+    lf = input("Loans from (ISO e.g. 2025-10-01T00:00:00 or blank): ").strip()
+    lt = input("Loans to   (ISO e.g. 2025-10-31T23:59:59 or blank): ").strip()
+
+    filters = {
+        "include_members": inc_m != "n",
+        "include_books":   inc_b != "n",
+        "include_loans":   inc_l != "n",
+        "active_members_only": only_active_m,
+        "loans_scope": loans_scope,
+        "loans_from": lf,
+        "loans_to": lt,
+    }
+
+    report = rep_mgr.build(filters)
+    print("\n" + report)
+
+    save = input("Save to file? (y/N): ").strip().lower()
+    if save == "y":
+        name = input("Filename (default report.txt): ").strip() or "report.txt"
+        with open(name, "w", encoding="utf-8") as f:
+            f.write(report)
+        print(f"✅ Saved: {name}")
+    _pause()
 
 # ========================= Main Menu =========================
 def menu_member(mem_mgr: MemberManager):
@@ -539,17 +736,20 @@ def main():
     mem_mgr  = MemberManager()
     book_mgr = BookManager()
     loan_mgr = LoanManager(mem_mgr=mem_mgr, book_mgr=book_mgr)
+    rep_mgr  = ReportManager(mem_mgr, book_mgr, loan_mgr)
 
     while True:
         print("\n===== Main Menu =====")
         print("1) Member")
         print("2) Book")
         print("3) Loan")
+        print("4) Report")
         print("0) Exit")
         cmd = input("Choose: ").strip()
         if cmd == "1": menu_member(mem_mgr)
         elif cmd == "2": menu_book(book_mgr)
         elif cmd == "3": menu_loan(loan_mgr)
+        elif cmd == "4": menu_report(rep_mgr)
         elif cmd == "0":
             print("Bye!")
             break
