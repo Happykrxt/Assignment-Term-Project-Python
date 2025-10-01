@@ -1,0 +1,1 @@
+{"student_id": "6806022511161", "first_name": "Kritsada", "last_name": "Butsri", "email": "s6806022511161@email.kmutnb.ac.th", "phone": "0989193161", "major": "", "year": "", "active": true, "created_at": "2025-10-01T17:50:56"}
