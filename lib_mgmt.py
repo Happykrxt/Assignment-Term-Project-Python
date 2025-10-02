@@ -7,6 +7,7 @@
 
 import os, struct, time
 from datetime import datetime, timedelta
+import shutil, unicodedata
 
 APP_VERSION = "1.0"
 MEMBERS_DAT = "members.dat"
@@ -22,9 +23,10 @@ def ensure_file(path: str):
 def now_epoch() -> int:
     return int(time.time())
 
-def fmt_epoch(ts: int) -> str:
+
+def fmt_date(ts: int) -> str:
     try:
-        return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(int(ts)).strftime("%Y-%m-%d")
     except Exception:
         return "-"
 
@@ -37,6 +39,115 @@ def pack_str(s: str, size: int) -> bytes:
 
 def unpack_str(b: bytes) -> str:
     return b.split(b"\x00", 1)[0].decode("utf-8", "ignore")
+
+# =============== Helpers: table rendering ===============
+def _disp_width(text: str) -> int:
+    w = 0
+    for ch in str(text):
+        if unicodedata.combining(ch):
+            continue
+        ea = unicodedata.east_asian_width(ch)
+        w += 2 if ea in ("W", "F") else 1
+    return w
+
+def _truncate_to_width(text: str, width: int) -> str:
+    # ตัดข้อความให้พอดีกว้าง width พร้อมเติม ‘…’ ถ้าจำเป็น
+    if _disp_width(text) <= width:
+        return text
+    if width <= 1:
+        return "…"[:width]
+    out = []
+    used = 0
+    for ch in str(text):
+        cw = 0 if unicodedata.combining(ch) else (2 if unicodedata.east_asian_width(ch) in ("W","F") else 1)
+        if used + cw >= width:  # เผื่อที่ให้ …
+            break
+        out.append(ch)
+        used += cw
+        if used >= width - 1:
+            break
+    return "".join(out) + "…"
+
+def _pad(text: str, width: int, align: str = "left") -> str:
+    # เติมช่องว่างให้ได้ความกว้างที่ “แสดง” เท่ากับ width
+    raw = str(text)
+    raw = _truncate_to_width(raw, width)
+    gap = width - _disp_width(raw)
+    if align == "right":
+        return " " * gap + raw
+    elif align == "center":
+        left = gap // 2
+        right = gap - left
+        return " " * left + raw + " " * right
+    else:
+        return raw + " " * gap
+
+def render_table(headers, rows, aligns=None, max_total=None, sep=" │ ", hline_char="─"):
+    """
+    headers: [str, ...]
+    rows:    [[cell,...], ...]
+    aligns:  ["left"/"right"/"center", ...] (ถ้าไม่ระบุ default = left)
+    max_total: จำกัดความกว้างตารางรวม (ไม่รวม margin ซ้ายขวา) ถ้า None จะใช้ความกว้างจอ
+    """
+    if aligns is None:
+        aligns = ["left"] * len(headers)
+
+    # ความกว้างขั้นต่ำของคอลัมน์ = max(ความกว้างที่แสดงของ header และค่ามากสุดในแถว)
+    cols = len(headers)
+    widths = [0] * cols
+    for i, h in enumerate(headers):
+        widths[i] = max(widths[i], _disp_width(h))
+    for r in rows:
+        for i in range(cols):
+            if i < len(r):
+                widths[i] = max(widths[i], _disp_width("" if r[i] is None else r[i]))
+
+    # เผื่อช่องคั่น
+    sep_w = _disp_width(sep)
+    table_content_width = sum(widths) + sep_w * (cols - 1)
+
+    # จำกัดให้พอดีกับจอ
+    term_w = shutil.get_terminal_size(fallback=(120, 30)).columns
+    limit = max_total or max(60, term_w - 2)   # กันเผื่อเล็กน้อย
+    if table_content_width > limit:
+        # ตัดคอลัมน์แบบกระจาย: จำกัดคอลัมน์ที่มีแนวโน้มยาว (เช่น title, name)
+        # กลยุทธิ์ง่าย ๆ: ใส่เพดานขั้นต่ำ 6 ตัวอักษร สำหรับทุกคอลัมน์ก่อน แล้วจึงลดตามสัดส่วน
+        min_col = [max(6, min(30, w)) for w in widths]
+        need = table_content_width - limit
+        # ลดความกว้างตั้งแต่คอลัมน์ที่กว้างที่สุดลงมาก่อน
+        pairs = sorted(list(enumerate(widths)), key=lambda x: x[1], reverse=True)
+        for idx, _w in pairs:
+            can_reduce = widths[idx] - min_col[idx]
+            if can_reduce <= 0:
+                continue
+            step = min(can_reduce, need)
+            widths[idx] -= step
+            need -= step
+            if need <= 0:
+                break
+        # ถ้ายังเกินอยู่ก็ยอมหลุดเล็กน้อย
+
+    # ฟังก์ชันวาดเส้น
+    def hline(ch=hline_char):
+        return ch * (sum(widths) + sep_w * (cols - 1))
+
+    # สร้างบรรทัดหัวตาราง
+    header_line = sep.join(_pad(headers[i], widths[i], "center") for i in range(cols))
+
+    # สร้างบรรทัดข้อมูล
+    body_lines = []
+    for r in rows:
+        cells = []
+        for i in range(cols):
+            val = "" if i >= len(r) or r[i] is None else str(r[i])
+            cells.append(_pad(val, widths[i], aligns[i] if i < len(aligns) else "left"))
+        body_lines.append(sep.join(cells))
+
+    # ประกอบผลลัพธ์
+    top = hline()
+    bottom = hline()
+    return "\n".join([top, header_line, top] + body_lines + [bottom])
+
 
 # ==========================================================
 #                        Members (184B)
@@ -283,13 +394,22 @@ def member_add(mem: MemberStore):
         print(f"{e}")
 
 def member_view(mem: MemberStore):
-    print("\n=== Member > View ===")
-    print(f"{'MemberID':<12} {'Name':<26} {'Email':<28} {'Phone':<14} {'Major':<10} {'Year':<4} {'Active':<6} {'Created':<19}")
-    print("-"*125)
+    print("\n=== Member > View ===\n")
+    headers = ["MemberID", "Name", "Email", "Phone", "Major", "Year", "Active"]
+    aligns  = ["left", "left", "left", "left", "left", "right", "center"]
+    rows = []
     for r in mem.iter_all():
-        name = (r['first_name']+" "+r['last_name']).strip()
-        print(f"{r['member_id']:<12} {name:<26} {r['email']:<28} {r['phone']:<14} {r['major']:<10} {r['year']:<4} "
-              f"{('Yes' if r['active'] else 'No'):<6} {fmt_epoch(r['created_at']):<19}")
+        name = (r['first_name'] + " " + r['last_name']).strip()
+        rows.append([
+            r['member_id'],
+            name,
+            r['email'],
+            r['phone'],
+            r['major'],
+            r['year'],
+            "Yes" if r['active'] else "No",
+        ])
+    print(render_table(headers, rows, aligns=aligns))
 
 def member_edit(mem: MemberStore):
     print("\n=== Member > Edit ===")
@@ -346,13 +466,20 @@ def book_add(bk: BookStore):
         print(f"{e}")
 
 def book_view(bk: BookStore):
-    print("\n=== Book > View ===")
-    print(f"{'BookID':<10} {'Title':<24} {'Author':<18} {'Year':<6} {'Copies':<7} {'Avail':<7} {'Created':<19}")
-    print("-"*100)
+    print("\n=== Book > View ===\n")
+    headers = ["BookID", "Title", "Author", "Year", "Copies", "Avail"]
+    aligns  = ["left", "left", "left", "right", "right", "right"]
+    rows = []
     for r in bk.iter_all():
-        print(f"{r['book_id']:<10} {r['title']:<24} {r['author']:<18} {str(r['year']):<6} "
-              f"{r['total_copies']:<7} {r['available_copies']:<7} {fmt_epoch(r['created_at']):<19}")
-
+        rows.append([
+            r['book_id'],
+            r['title'],
+            r['author'],
+            r['year'] if r['year'] else "",
+            r['total_copies'],
+            r['available_copies'],
+        ])
+    print(render_table(headers, rows, aligns=aligns))
 def book_edit(bk: BookStore):
     print("\n=== Book > Edit ===")
     bid = input("Book ID to edit: ").strip()
@@ -386,15 +513,68 @@ def book_delete(bk: BookStore):
         print(f"{e}")
 
 # ========== Loan ==========
-def loan_view(ln: LoanStore):
-    print("\n=== Loan > View ===")
-    print(f"{'LoanID':<14} {'MemberID':<12} {'BookID':<10} {'Status':<8} {'Loan':<19} {'Due':<19} {'Return':<19}")
-    print("-"*110)
-    for r in ln.iter_all():
-        status = {0:"borrowed",1:"returned",2:"late"}.get(r['status'], "?")
-        print(f"{r['loan_id']:<14} {r['member_id']:<12} {r['book_id']:<10} {status:<8} "
-              f"{fmt_epoch(r['loan_date']):<19} {fmt_epoch(r['due_date']):<19} "
-              f"{('-' if r['return_date']==0 else fmt_epoch(r['return_date'])):<19}")
+def loan_view(ln: LoanStore, mem: MemberStore = None, bk: BookStore = None):
+    """
+    - หัว/ท้ายตาราง (เส้นบน/หัว/ล่าง)
+    - แสดงชื่อสมาชิกแทน member_id
+    - ย้าย status ไปคอลัมน์สุดท้าย
+    - สรุปท้ายตาราง: วันนี้ยืมกี่คน คืนกี่คน ค้างเกินกำหนดกี่คน (นับคนไม่ซ้ำ)
+    - แสดงเฉพาะ 'วันที่' (YYYY-MM-DD)
+    """
+    import time
+    from datetime import datetime
+
+    mem = mem or MemberStore(MEMBERS_DAT)
+    bk  = bk  or BookStore(BOOKS_DAT)
+
+    mem_map  = {m["member_id"]: m for m in mem.iter_all()}
+    book_map = {b["book_id"]: b for b in bk.iter_all()}
+    loans = list(ln.iter_all())
+
+    headers = ["LoanID", "Member Name", "BookID", "Title", "LoanDate", "DueDate", "ReturnDate", "Status"]
+    aligns  = ["left", "left", "left", "left", "left", "left", "left", "left"]
+    rows = []
+
+    def status_text(s):
+        return {0: "borrowed", 1: "returned", 2: "late"}.get(s, "?")
+
+    today = datetime.now().date()
+    borrowers_today = set()
+    returns_today   = set()
+    overdue_people  = set()
+
+    for l in loans:
+        m = mem_map.get(l["member_id"], {})
+        b = book_map.get(l["book_id"], {})
+        member_name = ((m.get("first_name","") + " " + m.get("last_name","")).strip()) or "-"
+        title = b.get("title", "-")
+
+        rows.append([
+            l["loan_id"],
+            member_name,
+            l["book_id"],
+            title,
+            fmt_date(l["loan_date"]),
+            fmt_date(l["due_date"]),
+            "-" if l["return_date"] == 0 else fmt_date(l["return_date"]),
+            status_text(l["status"]),
+        ])
+
+        # summary (นับเป็น "คน" = member_id ไม่ซ้ำ)
+        loan_dt = datetime.fromtimestamp(l["loan_date"]).date() if l["loan_date"] else None
+        if loan_dt == today:
+            borrowers_today.add(l["member_id"])
+        if l["return_date"]:
+            ret_dt = datetime.fromtimestamp(l["return_date"]).date()
+            if ret_dt == today:
+                returns_today.add(l["member_id"])
+        if l["status"] == 0 and l["due_date"] < int(time.time()):
+            overdue_people.add(l["member_id"])
+
+    print("\n=== Loan > View ===\n")
+    print(render_table(headers, rows, aligns=aligns))
+    print(f"Summary today -> Borrowers: {len(borrowers_today)}  |  Returns: {len(returns_today)}  |  Overdue: {len(overdue_people)}\n")
+
 
 def loan_borrow(ln: LoanStore, mem: MemberStore, bk: BookStore):
     print("\n=== Loan > Borrow ===")
@@ -523,9 +703,9 @@ def build_report(mem: MemberStore, bk: BookStore, ln: LoanStore,
             mname = ((m.get("first_name","")+" "+m.get("last_name","")).strip()) or "-"
             status = {0:"borrowed",1:"returned",2:"late"}.get(l["status"], "?")
             out += (f"{l['loan_id']:<14} {l['member_id']:<12} {mname:<24} {l['book_id']:<10} "
-                    f"{b.get('title','-'):<22} {status:<8} {fmt_epoch(l['loan_date']):<19} "
-                    f"{fmt_epoch(l['due_date']):<19} "
-                    f"{('-' if l['return_date']==0 else fmt_epoch(l['return_date'])):<19}\n")
+                    f"{b.get('title','-'):<22} {status:<8} {fmt_date(l['loan_date']):<19} "
+                    f"{fmt_date(l['due_date']):<19} "
+                    f"{('-' if l['return_date']==0 else fmt_date(l['return_date'])):<19}\n")
         out += line() + "\n"
 
     # ---- Summary ----
