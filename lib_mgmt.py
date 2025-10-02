@@ -515,11 +515,15 @@ def book_delete(bk: BookStore):
 # ========== Loan ==========
 def loan_view(ln: LoanStore, mem: MemberStore = None, bk: BookStore = None):
     """
-    - หัว/ท้ายตาราง (เส้นบน/หัว/ล่าง)
-    - แสดงชื่อสมาชิกแทน member_id
-    - ย้าย status ไปคอลัมน์สุดท้าย
-    - สรุปท้ายตาราง: วันนี้ยืมกี่คน คืนกี่คน ค้างเกินกำหนดกี่คน (นับคนไม่ซ้ำ)
+    Loan View (เวอร์ชันปรับปรุง):
+    - หัว/ท้ายตารางด้วย render_table
+    - แสดงชื่อสมาชิกแทน member_id, Status ไปท้ายสุด
     - แสดงเฉพาะ 'วันที่' (YYYY-MM-DD)
+    - สรุปท้ายตาราง:
+        * Borrowed Today: สรุปสมาชิกที่ยืมวันนี้ รวมชื่อหนังสือของรายการที่ 'ยืมวันเดียวกัน' และ (ถ้ามี) 'คืนวันเดียวกัน'
+        * Returned Today: สรุปสมาชิกที่คืนวันนี้ รวมชื่อหนังสือของรายการที่ 'ยืมวันเดียวกัน' และ 'คืนวันเดียวกัน'
+        * Overdue: นับจำนวนสมาชิกที่ยัง Borrowed และเลยกำหนดคืน (unique)
+    - ในการรวม (group) จะเลือก loan_id ตัวแทนของกลุ่มเป็นค่าที่น้อยสุด (lexicographical min)
     """
     import time
     from datetime import datetime
@@ -531,6 +535,7 @@ def loan_view(ln: LoanStore, mem: MemberStore = None, bk: BookStore = None):
     book_map = {b["book_id"]: b for b in bk.iter_all()}
     loans = list(ln.iter_all())
 
+    # ===== ตารางหลัก =====
     headers = ["LoanID", "Member Name", "BookID", "Title", "LoanDate", "DueDate", "ReturnDate", "Status"]
     aligns  = ["left", "left", "left", "left", "left", "left", "left", "left"]
     rows = []
@@ -539,13 +544,20 @@ def loan_view(ln: LoanStore, mem: MemberStore = None, bk: BookStore = None):
         return {0: "borrowed", 1: "returned", 2: "late"}.get(s, "?")
 
     today = datetime.now().date()
-    borrowers_today = set()
-    returns_today   = set()
-    overdue_people  = set()
+    borrowers_today_set = set()  # สมาชิกที่ 'ยืม' วันนี้ (unique member_id)
+    returns_today_set   = set()  # สมาชิกที่ 'คืน' วันนี้ (unique member_id)
+    overdue_people_set  = set()  # สมาชิกที่ 'ยังยืม' และ 'เกินกำหนด' (unique member_id)
+
+    # เก็บข้อมูลที่ใช้สำหรับสรุปแบบ grouping
+    # key สำหรับ 'Borrowed Today' = (member_id, loan_date_date, return_date_date or None)
+    groups_borrow_today = {}
+    # key สำหรับ 'Returned Today' = (member_id, loan_date_date, return_date_date)
+    groups_return_today = {}
 
     for l in loans:
         m = mem_map.get(l["member_id"], {})
         b = book_map.get(l["book_id"], {})
+
         member_name = ((m.get("first_name","") + " " + m.get("last_name","")).strip()) or "-"
         title = b.get("title", "-")
 
@@ -560,20 +572,75 @@ def loan_view(ln: LoanStore, mem: MemberStore = None, bk: BookStore = None):
             status_text(l["status"]),
         ])
 
-        # summary (นับเป็น "คน" = member_id ไม่ซ้ำ)
-        loan_dt = datetime.fromtimestamp(l["loan_date"]).date() if l["loan_date"] else None
-        if loan_dt == today:
-            borrowers_today.add(l["member_id"])
-        if l["return_date"]:
-            ret_dt = datetime.fromtimestamp(l["return_date"]).date()
-            if ret_dt == today:
-                returns_today.add(l["member_id"])
+        # ===== นับชุด "วันนี้" =====
+        loan_d = datetime.fromtimestamp(l["loan_date"]).date() if l["loan_date"] else None
+        ret_d  = (datetime.fromtimestamp(l["return_date"]).date()
+                  if l["return_date"] else None)
+
+        # ผู้ที่ 'ยืม' วันนี้
+        if loan_d == today:
+            borrowers_today_set.add(l["member_id"])
+            # รวมตาม (member_id, loan_d, ret_d|None) เพื่อทำกลุ่ม "ถ้ายืมวันเดียวกัน และถ้าคืนวันเดียวกัน"
+            key_b = (l["member_id"], loan_d, ret_d if ret_d == today else None)
+            g = groups_borrow_today.setdefault(key_b, {"loan_ids": [], "titles": set()})
+            g["loan_ids"].append(l["loan_id"])
+            if title:
+                g["titles"].add(title)
+
+        # ผู้ที่ 'คืน' วันนี้
+        if ret_d == today:
+            returns_today_set.add(l["member_id"])
+            # รวมตาม (member_id, loan_d, ret_d) โดยต้องคืนวันนี้แน่ ๆ
+            key_r = (l["member_id"], loan_d, ret_d)
+            g = groups_return_today.setdefault(key_r, {"loan_ids": [], "titles": set()})
+            g["loan_ids"].append(l["loan_id"])
+            if title:
+                g["titles"].add(title)
+
+        # Overdue: ยังยืมอยู่ และเกินกำหนด ณ ตอนนี้
         if l["status"] == 0 and l["due_date"] < int(time.time()):
-            overdue_people.add(l["member_id"])
+            overdue_people_set.add(l["member_id"])
 
     print("\n=== Loan > View ===\n")
     print(render_table(headers, rows, aligns=aligns))
-    print(f"Summary today -> Borrowers: {len(borrowers_today)}  |  Returns: {len(returns_today)}  |  Overdue: {len(overdue_people)}\n")
+
+    # ====== ส่วนสรุปแบบอ่านง่าย ======
+    # ตัวช่วยแสดงชื่อสมาชิกจาก member_id
+    def member_display(mid: str) -> str:
+        mm = mem_map.get(mid, {})
+        return ((mm.get("first_name","") + " " + mm.get("last_name","")).strip()) or mid or "-"
+
+    # ---- สรุป: Borrowed Today ----
+    if groups_borrow_today:
+        print("Borrowed Today")
+        # เรียงตามชื่อสมาชิกเพื่ออ่านง่าย
+        for key in sorted(groups_borrow_today.keys(), key=lambda k: member_display(k[0])):
+            mid, loan_d, ret_d = key
+            g = groups_borrow_today[key]
+            rep_loan_id = min(g["loan_ids"])  # ใช้ loan_id ตัวแทนที่เล็กสุดในกลุ่ม
+            titles = ", ".join(sorted(g["titles"])) if g["titles"] else "-"
+            md = member_display(mid)
+            # กรณีมีคืนวันนี้ (ret_d == today) เราจะโชว์เป็น “(borrow & return today)”
+            note = " (borrow & return today)" if ret_d is not None else ""
+            print(f"- {md}  | LoanID: {rep_loan_id} | {titles}{note}")
+        print()
+
+    # ---- สรุป: Returned Today ----
+    if groups_return_today:
+        print("Returned Today")
+        for key in sorted(groups_return_today.keys(), key=lambda k: member_display(k[0])):
+            mid, loan_d, ret_d = key
+            g = groups_return_today[key]
+            rep_loan_id = min(g["loan_ids"])
+            titles = ", ".join(sorted(g["titles"])) if g["titles"] else "-"
+            md = member_display(mid)
+            # ถ้าทั้งยืมและคืนวันนี้จริง ๆ ก็ถือว่าเป็น same-day pair
+            note = " (same-day)" if (loan_d == today and ret_d == today) else ""
+            print(f"- {md}  | LoanID: {rep_loan_id} | {titles}{note}")
+        print()
+
+    # ---- Count Summary line ----
+    print(f"Summary today -> Borrowers: {len(borrowers_today_set)}  |  Returns: {len(returns_today_set)}  |  Overdue: {len(overdue_people_set)}\n")
 
 
 def loan_borrow(ln: LoanStore, mem: MemberStore, bk: BookStore):
@@ -636,43 +703,53 @@ def build_report(mem: MemberStore, bk: BookStore, ln: LoanStore,
                  include_members=True, include_books=True, include_loans=True,
                  active_members_only=False, loans_scope="all",
                  loans_from="", loans_to="") -> str:
+    """Summary Report แบบข้อความ — แสดงเฉพาะ 'วันที่' ในส่วน Loans และวาง Status ไว้คอลัมน์สุดท้าย"""
 
-    def line(w=118, ch="-"): return ch*w
+    def mkline(width: int, ch: str = "-") -> str:
+        return ch * width
+
     now = datetime.now()
-    h  = []
-    h += ["Library System — Summary Report",
-          f"Generated At : {now.strftime('%Y-%m-%d %H:%M:%S')} (+{now.astimezone().utcoffset()})",
-          f"App Version  : {APP_VERSION}",
-          "Endianness   : Little-Endian",
-          "Encoding     : UTF-8 (fixed-length)"]
-    out = "\n".join(h) + "\n" + line() + "\n"
+    header_lines = [
+        "Library System — Summary Report",
+        f"Generated At : {now.strftime('%Y-%m-%d')}",
+        f"App Version  : {APP_VERSION}",
+        "Endianness   : Little-Endian",
+        "Encoding     : UTF-8 (fixed-length)",
+    ]
+    out = "\n".join(header_lines)
 
-    # ---- Members ----
+    # ---------------- Members ----------------
     members = list(mem.iter_all())
     if active_members_only:
         members = [m for m in members if m.get("active", True)]
-    if include_members:
-        out += "\nMembers\n" + line() + "\n"
-        out += f"{'MemberID':<12} {'Name':<26} {'Email':<28} {'Phone':<14} {'Major':<10} {'Year':<4} {'Active':<6}\n"
-        out += line() + "\n"
-        for m in members:
-            name = (m['first_name']+" "+m['last_name']).strip()
-            out += f"{m['member_id']:<12} {name:<26} {m['email']:<28} {m['phone']:<14} {m['major']:<10} {m['year']:<4} {('Yes' if m['active'] else 'No'):<6}\n"
-        out += line() + "\n"
 
-    # ---- Books ----
+    if include_members:
+        out += "\n\nMembers\n"
+        head_m = f"{'MemberID':<12} {'Name':<26} {'Email':<28} {'Phone':<14} {'Major':<10} {'Year':<4} {'Active':<6}"
+        line_m = mkline(len(head_m))
+        out += line_m + "\n" + head_m + "\n" + line_m + "\n"
+        for m in members:
+            name = (m['first_name'] + " " + m['last_name']).strip()
+            out += (f"{m['member_id']:<12} {name:<26} {m['email']:<28} {m['phone']:<14} "
+                    f"{m['major']:<10} {m['year']:<4} {('Yes' if m['active'] else 'No'):<6}\n")
+        out += line_m
+
+    # ---------------- Books ----------------
     books = list(bk.iter_all())
     if include_books:
-        out += "\nBooks\n" + line() + "\n"
-        out += f"{'BookID':<10} {'Title':<24} {'Author':<18} {'Year':<6} {'Copies':<7} {'Avail':<7}\n"
-        out += line() + "\n"
+        out += "\n\nBooks\n"
+        head_b = f"{'BookID':<10} {'Title':<24} {'Author':<18} {'Year':<6} {'Copies':<7} {'Avail':<7}"
+        line_b = mkline(len(head_b))
+        out += line_b + "\n" + head_b + "\n" + line_b + "\n"
         for b in books:
-            out += f"{b['book_id']:<10} {b['title']:<24} {b['author']:<18} {str(b['year']):<6} {b['total_copies']:<7} {b['available_copies']:<7}\n"
-        out += line() + "\n"
+            out += (f"{b['book_id']:<10} {b['title']:<24} {b['author']:<18} "
+                    f"{str(b['year'] or ''):<6} {b['total_copies']:<7} {b['available_copies']:<7}\n")
+        out += line_b
 
-    # ---- Loans (join) ----
+    # ---------------- Loans (with joins) ----------------
     loans = list(ln.iter_all())
-    # scope
+
+    # scope filter
     if loans_scope == "active":
         loans = [l for l in loans if l["status"] == 0]
     elif loans_scope == "returned":
@@ -680,35 +757,47 @@ def build_report(mem: MemberStore, bk: BookStore, ln: LoanStore,
     elif loans_scope == "overdue":
         loans = [l for l in loans if l["status"] == 0 and l["due_date"] < now_epoch()]
 
-    # range by loan_date
+    # date-range filter (by loan_date, input ISO)
     def parse_iso(s):
-        try: return int(datetime.fromisoformat(s).timestamp())
-        except: return None
+        try:
+            return int(datetime.fromisoformat(s).timestamp())
+        except Exception:
+            return None
     from_ts = parse_iso(loans_from) if loans_from else None
-    to_ts   = parse_iso(loans_to) if loans_to else None
+    to_ts   = parse_iso(loans_to)   if loans_to   else None
     if from_ts is not None:
         loans = [l for l in loans if l["loan_date"] >= from_ts]
     if to_ts is not None:
         loans = [l for l in loans if l["loan_date"] <= to_ts]
 
     if include_loans:
-        out += "\nLoans\n" + line() + "\n"
-        out += f"{'LoanID':<14} {'MemberID':<12} {'Member Name':<24} {'BookID':<10} {'Title':<22} {'Status':<8} {'Loan':<19} {'Due':<19} {'Return':<19}\n"
-        out += line() + "\n"
+        out += "\n\nLoans\n"
+        # เปลี่ยนหัวคอลัมน์: ใช้วันที่แบบ 10 ตัวอักษร และย้าย Status ไปท้ายสุด
+        head_l = (
+            f"{'LoanID':<14} {'MemberID':<12} {'Member Name':<24} "
+            f"{'BookID':<10} {'Title':<22} {'Loan':<10} {'Due':<10} {'Return':<10} {'Status':<8}"
+        )
+        line_l = mkline(len(head_l))
+        out += line_l + "\n" + head_l + "\n" + line_l + "\n"
+
         mem_map  = {m["member_id"]: m for m in mem.iter_all()}
         book_map = {b["book_id"]: b for b in bk.iter_all()}
+
+        def status_text(s):
+            return {0: "borrowed", 1: "returned", 2: "late"}.get(s, "?")
+
         for l in loans:
             m = mem_map.get(l["member_id"], {})
             b = book_map.get(l["book_id"], {})
-            mname = ((m.get("first_name","")+" "+m.get("last_name","")).strip()) or "-"
-            status = {0:"borrowed",1:"returned",2:"late"}.get(l["status"], "?")
-            out += (f"{l['loan_id']:<14} {l['member_id']:<12} {mname:<24} {l['book_id']:<10} "
-                    f"{b.get('title','-'):<22} {status:<8} {fmt_date(l['loan_date']):<19} "
-                    f"{fmt_date(l['due_date']):<19} "
-                    f"{('-' if l['return_date']==0 else fmt_date(l['return_date'])):<19}\n")
-        out += line() + "\n"
+            mname = ((m.get("first_name","") + " " + m.get("last_name","")).strip()) or "-"
+            out += (
+                f"{l['loan_id']:<14} {l['member_id']:<12} {mname:<24} {l['book_id']:<10} "
+                f"{b.get('title','-'):<22} {fmt_date(l['loan_date']):<10} {fmt_date(l['due_date']):<10} "
+                f"{('-' if l['return_date']==0 else fmt_date(l['return_date'])):<10} {status_text(l['status']):<8}\n"
+            )
+        out += line_l
 
-    # ---- Summary ----
+    # ---------------- Summary ----------------
     active_m = [m for m in mem.iter_all() if m.get("active", True)]
     total_titles = len(books)
     total_copies = sum(b["total_copies"] for b in books)
@@ -716,13 +805,13 @@ def build_report(mem: MemberStore, bk: BookStore, ln: LoanStore,
     active_loans = [l for l in ln.iter_all() if l["status"] == 0]
     overdue_cnt  = sum(1 for l in active_loans if l["due_date"] < now_epoch())
 
-    out += "\nSummary\n"
+    out += "\n\nSummary\n"
     out += f"- Members (all/active): {len(list(mem.iter_all()))} / {len(active_m)}\n"
     out += f"- Books (titles):       {total_titles}\n"
     out += f"- Copies (total/avail): {total_copies} / {avail_copies}\n"
     out += f"- Loans (active):       {len(active_loans)}\n"
     out += f"- Overdue:              {overdue_cnt}\n"
-    out += line() + "\n"
+    out += mkline(60) + "\n"
     return out
 
 def report_menu(mem: MemberStore, bk: BookStore, ln: LoanStore):
