@@ -1,0 +1,18 @@
+══════════════════════════════════════════
+Library Management System — Lending Report
+Generated At : 2025-10-05 14:36
+App Version  : 1.0
+Encoding     : UTF-8
+══════════════════════════════════════════
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+   LoanID    │ MemberID │  Member Name  │     Email      │ BookID │        Book Title         │  Author  │ Loan Date  │  Due Date  │ Return Date │  Status 
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+LN1759396679 │ M001     │ Anan Phonchai │ anan@gmail.com │ B002   │ Data Structures in C      │ A. Kumar │ 2025-10-02 │ 2025-10-09 │ -           │ borrowed
+LN1759396726 │ M001     │ Anan Phonchai │ anan@gmail.com │ B001   │ Python Programming Basics │ J. Smith │ 2025-10-02 │ 2025-10-09 │ -           │ borrowed
+───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Summary
+- Total Lendings    : 2
+- Currently Borrowed: 2
+- Overdue           : 0
+- Active Members    : 5
